@@ -3624,7 +3624,7 @@ static std::vector<uint64_t> GetExternalScanoutModifiers( std::span<const uint32
 // them into Vulkan, instead of allocating with Vulkan and exporting.
 // Fixes scanout on drivers that need special placement for scanout memory
 // (NVIDIA needs physical contiguity, which only its GBM path guarantees).
-static bool vulkan_make_output_images_external( VulkanOutput_t *pOutput, const CVulkanTexture::createFlags &outputImageflags )
+static bool vulkan_make_output_images_external( VulkanOutput_t *pOutput, const CVulkanTexture::createFlags &outputImageflags, uint32_t uOutputWidth, uint32_t uOutputHeight )
 {
 	uint32_t uFormats[2] = { pOutput->uOutputFormat, DRM_FORMAT_INVALID };
 	size_t nFormats = 1;
@@ -3643,7 +3643,7 @@ static bool vulkan_make_output_images_external( VulkanOutput_t *pOutput, const C
 	for ( size_t i = 0; i < 3; i++ )
 	{
 		std::shared_ptr<gamescope::IBackendScanoutBuffer> pScanoutBuffer =
-			GetBackend()->CreateScanoutBuffer( g_nOutputWidth, g_nOutputHeight, pOutput->uOutputFormat, modifiers, false );
+			GetBackend()->CreateScanoutBuffer( uOutputWidth, uOutputHeight, pOutput->uOutputFormat, modifiers, false );
 		if ( !pScanoutBuffer )
 			return false;
 
@@ -3651,7 +3651,7 @@ static bool vulkan_make_output_images_external( VulkanOutput_t *pOutput, const C
 		wlr_dmabuf_attributes attrs = *pScanoutBuffer->GetDmabufAttributes();
 
 		pOutput->outputImages[i] = new CVulkanTexture();
-		if ( !pOutput->outputImages[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, pOutput->uOutputFormat, outputImageflags, &attrs, 0, 0, nullptr, nullptr, pScanoutBuffer ) )
+		if ( !pOutput->outputImages[i]->BInit( uOutputWidth, uOutputHeight, 1u, pOutput->uOutputFormat, outputImageflags, &attrs, 0, 0, nullptr, nullptr, pScanoutBuffer ) )
 			return false;
 
 		if ( bOverlay )
@@ -3665,7 +3665,7 @@ static bool vulkan_make_output_images_external( VulkanOutput_t *pOutput, const C
 			attrs.format = pOutput->uOutputFormatOverlay;
 
 			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
-			if ( !pOutput->outputImagesPartialOverlay[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, pOutput->uOutputFormatOverlay, outputImageflags, &attrs, 0, 0, nullptr, nullptr, pScanoutBuffer ) )
+			if ( !pOutput->outputImagesPartialOverlay[i]->BInit( uOutputWidth, uOutputHeight, 1u, pOutput->uOutputFormatOverlay, outputImageflags, &attrs, 0, 0, nullptr, nullptr, pScanoutBuffer ) )
 				return false;
 		}
 	}
@@ -3692,9 +3692,15 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	pOutput->outputImagesPartialOverlay[1] = nullptr;
 	pOutput->outputImagesPartialOverlay[2] = nullptr;
 
+	// Output images are physical-oriented; the panel scans out unrotated.
+	uint32_t uOutputWidth = g_nOutputWidth;
+	uint32_t uOutputHeight = g_nOutputHeight;
+	if ( g_uOutputRotation & 1u )
+		std::swap( uOutputWidth, uOutputHeight );
+
 	if ( GetBackend()->SupportsExternalScanoutBuffers() && g_device.supportsModifiers() )
 	{
-		if ( vulkan_make_output_images_external( pOutput, outputImageflags ) )
+		if ( vulkan_make_output_images_external( pOutput, outputImageflags, uOutputWidth, uOutputHeight ) )
 		{
 			// Oh no.
 			pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
@@ -3709,12 +3715,6 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	}
 
 	uint32_t uDRMFormat = pOutput->uOutputFormat;
-
-	// Output images are physical-oriented; the panel scans out unrotated.
-	uint32_t uOutputWidth = g_nOutputWidth;
-	uint32_t uOutputHeight = g_nOutputHeight;
-	if ( g_uOutputRotation & 1u )
-		std::swap( uOutputWidth, uOutputHeight );
 
 	pOutput->outputImages[0] = new CVulkanTexture();
 	bool bSuccess = pOutput->outputImages[0]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
