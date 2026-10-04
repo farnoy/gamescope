@@ -57,7 +57,7 @@
 #include "wlr_end.hpp"
 
 #if HAVE_GBM
-#include <gbm.h>
+#include "GbmScanoutBuffer.h"
 #endif
 
 #include "gamescope-control-protocol.h"
@@ -576,32 +576,6 @@ namespace gamescope
 		uint32_t m_uFbId = 0;
 	};
 
-#if HAVE_GBM
-	class CDRMScanoutBuffer final : public IBackendScanoutBuffer
-	{
-	public:
-		CDRMScanoutBuffer( std::shared_ptr<struct gbm_device> pDevice, struct gbm_bo *pBo, const wlr_dmabuf_attributes &attrs )
-			: m_pDevice{ std::move( pDevice ) }
-			, m_pBo{ pBo }
-			, m_Attrs{ attrs }
-		{
-		}
-
-		~CDRMScanoutBuffer()
-		{
-			wlr_dmabuf_attributes_finish( &m_Attrs );
-			gbm_bo_destroy( m_pBo );
-		}
-
-		const wlr_dmabuf_attributes *GetDmabufAttributes() const override { return &m_Attrs; }
-
-	private:
-		// Declared before m_pBo so the device outlives the bo.
-		std::shared_ptr<struct gbm_device> m_pDevice;
-		struct gbm_bo *m_pBo = nullptr;
-		wlr_dmabuf_attributes m_Attrs = {};
-	};
-#endif
 }
 
 uint32_t g_nDRMFormat = DRM_FORMAT_INVALID;
@@ -1609,22 +1583,9 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 	// (gbm_bo_destroy) stays valid even after wlsession_close_kms() has
 	// closed drm->fd; textures holding GBM buffers can outlive the backend
 	// on shutdown. The deleter closes the dup'd fd after the device.
-	if ( int nGbmFd = dup( drm->fd ); nGbmFd >= 0 )
-	{
-		if ( struct gbm_device *pGbmDevice = gbm_create_device( nGbmFd ) )
-		{
-			drm->gbm = std::shared_ptr<struct gbm_device>( pGbmDevice, [ nGbmFd ]( struct gbm_device *pDevice ){ gbm_device_destroy( pDevice ); close( nGbmFd ); } );
-		}
-		else
-		{
-			close( nGbmFd );
-			drm_log.errorf( "Failed to create GBM device on the KMS fd. GBM scanout buffers will be unavailable." );
-		}
-	}
-	else
-	{
-		drm_log.errorf_errno( "Failed to dup KMS fd for GBM. GBM scanout buffers will be unavailable." );
-	}
+	drm->gbm = gamescope::CreateGbmDevice( drm->fd );
+	if ( !drm->gbm )
+		drm_log.errorf( "GBM scanout buffers will be unavailable." );
 
 	if ( drm->bIsNvidia && !cv_drm_gbm_scanout )
 	{
@@ -4334,96 +4295,7 @@ namespace gamescope
 			if ( !g_DRM.gbm )
 				return nullptr;
 
-			uint32_t uFlags = GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT;
-
-			bool bForceLinearModifier = false;
-			struct gbm_bo *pBo = nullptr;
-			if ( bLinear )
-			{
-				// GBM rejects GBM_BO_USE_LINEAR combined with an explicit
-				// modifier list (EINVAL in Mesa), so allocate directly.
-				pBo = gbm_bo_create( g_DRM.gbm.get(), uWidth, uHeight, uDrmFormat, uFlags | GBM_BO_USE_LINEAR );
-				bForceLinearModifier = true;
-			}
-			else if ( !ulModifiers.empty() )
-			{
-				pBo = gbm_bo_create_with_modifiers2( g_DRM.gbm.get(), uWidth, uHeight, uDrmFormat, ulModifiers.data(), ulModifiers.size(), uFlags );
-
-				// Some GBM implementations cannot allocate with an explicit
-				// modifier list at all. If only LINEAR was requested, a plain
-				// allocation with GBM_BO_USE_LINEAR is equivalent.
-				if ( !pBo && ulModifiers.size() == 1 && ulModifiers[0] == DRM_FORMAT_MOD_LINEAR )
-				{
-					pBo = gbm_bo_create( g_DRM.gbm.get(), uWidth, uHeight, uDrmFormat, uFlags | GBM_BO_USE_LINEAR );
-					bForceLinearModifier = true;
-				}
-			}
-
-			if ( !pBo )
-			{
-				drm_log.errorf( "CreateScanoutBuffer: GBM allocation failed for %ux%u format 0x%x", uWidth, uHeight, uDrmFormat );
-				return nullptr;
-			}
-
-			wlr_dmabuf_attributes attrs =
-			{
-				.width = int32_t( uWidth ),
-				.height = int32_t( uHeight ),
-				.format = uDrmFormat,
-				.modifier = bForceLinearModifier ? DRM_FORMAT_MOD_LINEAR : gbm_bo_get_modifier( pBo ),
-			};
-
-			const int nPlaneCount = gbm_bo_get_plane_count( pBo );
-			bool bSuccess = nPlaneCount >= 1 && nPlaneCount <= WLR_DMABUF_MAX_PLANES;
-
-			if ( bSuccess && !bForceLinearModifier && !Algorithm::Contains( ulModifiers, attrs.modifier ) )
-			{
-				drm_log.errorf( "CreateScanoutBuffer: GBM returned modifier 0x%" PRIx64 " which was not in the allowed list", attrs.modifier );
-				bSuccess = false;
-			}
-
-			// Only count a plane in n_planes once we own its fd, so that
-			// wlr_dmabuf_attributes_finish never closes an fd we didn't acquire.
-			for ( int i = 0; bSuccess && i < nPlaneCount; i++ )
-			{
-				int nFd = gbm_bo_get_fd_for_plane( pBo, i );
-				if ( nFd < 0 )
-				{
-					drm_log.errorf_errno( "CreateScanoutBuffer: gbm_bo_get_fd_for_plane failed" );
-					bSuccess = false;
-					break;
-				}
-				attrs.fd[i] = nFd;
-				attrs.offset[i] = gbm_bo_get_offset( pBo, i );
-				attrs.stride[i] = gbm_bo_get_stride_for_plane( pBo, i );
-				attrs.n_planes = i + 1;
-			}
-			bSuccess = bSuccess && attrs.n_planes == nPlaneCount;
-
-			// Vulkan's dmabuf memory import is single-fd: all planes must
-			// reference the same underlying buffer.
-			for ( int i = 1; bSuccess && i < attrs.n_planes; i++ )
-			{
-				struct stat first, other;
-				if ( fstat( attrs.fd[0], &first ) != 0 || fstat( attrs.fd[i], &other ) != 0 ||
-				     first.st_dev != other.st_dev || first.st_ino != other.st_ino )
-				{
-					drm_log.errorf( "CreateScanoutBuffer: GBM returned a disjoint multi-plane bo, cannot import" );
-					bSuccess = false;
-				}
-			}
-
-			if ( !bSuccess )
-			{
-				wlr_dmabuf_attributes_finish( &attrs );
-				gbm_bo_destroy( pBo );
-				return nullptr;
-			}
-
-			drm_log.debugf( "CreateScanoutBuffer: allocated %ux%u format 0x%x modifier 0x%" PRIx64 " (%d planes)",
-				uWidth, uHeight, uDrmFormat, attrs.modifier, attrs.n_planes );
-
-			return std::make_shared<CDRMScanoutBuffer>( g_DRM.gbm, pBo, attrs );
+			return CreateGbmScanoutBuffer( g_DRM.gbm, uWidth, uHeight, uDrmFormat, ulModifiers, bLinear );
 #else
 			return nullptr;
 #endif
