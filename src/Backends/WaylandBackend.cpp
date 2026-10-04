@@ -10,6 +10,9 @@
 #include "refresh_rate.h"
 #include "waitable.h"
 #include "Utils/TempFiles.h"
+#if HAVE_GBM
+#include "GbmScanoutBuffer.h"
+#endif
 
 #include <cinttypes>
 #include <cstring>
@@ -123,6 +126,11 @@ namespace gamescope
     gamescope::ConVar<bool> cv_wayland_mouse_warp_without_keyboard_focus( "wayland_mouse_warp_without_keyboard_focus", true, "Should we only forward mouse warps to the app when we have keyboard focus?" );
     gamescope::ConVar<bool> cv_wayland_mouse_relmotion_without_keyboard_focus( "wayland_mouse_relmotion_without_keyboard_focus", false, "Should we only forward mouse relative motion to the app when we have keyboard focus?" );
     gamescope::ConVar<bool> cv_wayland_use_modifiers( "wayland_use_modifiers", true, "Use DMA-BUF modifiers?" );
+    gamescope::ConVar<bool> cv_wayland_gbm_scanout( "wayland_gbm_scanout", true, "On NVIDIA, allocate output images with GBM and composite while fullscreen, so the host compositor never scans out Vulkan-allocated memory, which NVIDIA's display engine can misread at 4K.",
+        []( gamescope::ConVar<bool> & )
+        {
+            g_bForceOutputImageRemake = true;
+        });
 
     gamescope::ConVar<float> cv_wayland_hdr10_saturation_scale( "wayland_hdr10_saturation_scale", 1.0, "Saturation scale for HDR10 content by gamut expansion. 1.0 - 1.2 is a good range to play with." );
 
@@ -672,6 +680,9 @@ namespace gamescope
         virtual bool UsesModifiers() const override;
         virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const override;
 
+        virtual bool SupportsExternalScanoutBuffers() const override;
+        virtual std::shared_ptr<IBackendScanoutBuffer> CreateScanoutBuffer( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat, std::span<const uint64_t> ulModifiers, bool bLinear ) override;
+
         virtual IBackendConnector *GetCurrentConnector() override;
         virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) override;
 
@@ -852,6 +863,13 @@ namespace gamescope
 
         bool m_bCanUseModifiers = false;
         std::unordered_map<uint32_t, std::vector<uint64_t>> m_FormatModifiers;
+
+#if HAVE_GBM
+        // Created on first use: output images are made before PostInit, but
+        // after the Vulkan device has opened its render node.
+        std::shared_ptr<gbm_device> GetGbmDevice() const;
+        mutable std::optional<std::shared_ptr<gbm_device>> m_oGbmDevice;
+#endif
         std::unordered_map<uint32_t, wl_buffer *> m_ImportedFbs;
 
         uint32_t m_uPointerEnterSerial = 0;
@@ -2358,6 +2376,53 @@ namespace gamescope
             return std::span<const uint64_t>{};
 
         return std::span<const uint64_t>{ iter->second.begin(), iter->second.end() };
+    }
+
+#if HAVE_GBM
+    std::shared_ptr<gbm_device> CWaylandBackend::GetGbmDevice() const
+    {
+        if ( m_oGbmDevice )
+            return *m_oGbmDevice;
+
+        m_oGbmDevice = nullptr;
+
+        const int nRenderFd = g_device.drmRenderFd();
+        if ( nRenderFd < 0 )
+            return nullptr;
+
+        bool bIsNvidia = false;
+        if ( drmVersion *pVersion = drmGetVersion( nRenderFd ) )
+        {
+            bIsNvidia = pVersion->name && !strcmp( pVersion->name, "nvidia-drm" );
+            drmFreeVersion( pVersion );
+        }
+
+        // Only NVIDIA is known to need this; elsewhere Vulkan's own scanout
+        // allocations are fine and avoid forcing composition.
+        if ( !bIsNvidia )
+            return nullptr;
+
+        m_oGbmDevice = CreateGbmDevice( nRenderFd );
+        return *m_oGbmDevice;
+    }
+#endif
+
+    bool CWaylandBackend::SupportsExternalScanoutBuffers() const
+    {
+#if HAVE_GBM
+        return cv_wayland_gbm_scanout && UsesModifiers() && GetGbmDevice() != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    std::shared_ptr<IBackendScanoutBuffer> CWaylandBackend::CreateScanoutBuffer( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat, std::span<const uint64_t> ulModifiers, bool bLinear )
+    {
+#if HAVE_GBM
+        return CreateGbmScanoutBuffer( GetGbmDevice(), uWidth, uHeight, uDrmFormat, ulModifiers, bLinear );
+#else
+        return nullptr;
+#endif
     }
 
     IBackendConnector *CWaylandBackend::GetCurrentConnector()
