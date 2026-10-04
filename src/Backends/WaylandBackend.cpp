@@ -1102,6 +1102,16 @@ namespace gamescope
                                                eLayer0Filter == GamescopeUpscaleFilter::PIXEL ) && !bLayer0ScreenSize;
 
             bNeedsFullComposite |= cv_composite_force;
+            // The host compositor can scan out a fullscreen surface's buffer
+            // directly. Hand it our GBM-allocated output image instead of a
+            // client's Vulkan-allocated buffer. Output images are made on the
+            // first composite, so an empty ring composites too. If GBM
+            // allocation fell back to Vulkan, compositing would not help.
+            if ( g_bFullscreen && m_pBackend->SupportsExternalScanoutBuffers() )
+            {
+                gamescope::Rc<CVulkanTexture> pNextImage = vulkan_get_next_output_image( false );
+                bNeedsFullComposite |= !pNextImage || pNextImage->IsBackendAllocated();
+            }
             bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
             bNeedsFullComposite |= pFrameInfo->useNISLayer0;
             bNeedsFullComposite |= pFrameInfo->useSGSRLayer0;

@@ -182,6 +182,7 @@ public:
 	inline uint32_t contentHeight() {return m_contentHeight; }
 	inline uint32_t rowPitch() { return m_unRowPitch; }
 	inline gamescope::IBackendFb* GetBackendFb() { return m_pBackendFb.get(); }
+	bool IsBackendAllocated() const { return m_pScanoutBuffer != nullptr; }
 	inline uint8_t *mappedData() { return m_pMappedData; }
 	inline VkFormat format() const { return m_format; }
 	inline bool transferSrc() const { return m_bTransferSrc; }
