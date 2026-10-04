@@ -11,6 +11,7 @@
 #include "waitable.h"
 #include "Utils/TempFiles.h"
 
+#include <cinttypes>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -496,6 +497,7 @@ namespace gamescope
 
         void OnCompositorAcquire();
         void OnCompositorRelease();
+        bool IsCompositorAcquired() const { return m_bCompositorAcquired; }
 
         wl_buffer *GetHostBuffer() const { return m_pHostBuffer; }
         wlr_buffer *GetClientBuffer() const { return m_pClientBuffer; }
@@ -735,6 +737,10 @@ namespace gamescope
 		wl_region *GetEmptyRegion() const { return m_pEmptyRegion; }
         wl_region *GetFullRegion() const { return m_pFullRegion; }
         CWaylandFb *GetBlackFb() const { return m_BlackFb.get(); }
+
+        // Dispatches host events until the host compositor releases pFb.
+        // Returns false if it still holds it after a timeout.
+        bool WaitForHostRelease( CWaylandFb *pFb );
 
         void OnConnectorDestroyed( CWaylandConnector *pConnector )
         {
@@ -1130,6 +1136,16 @@ namespace gamescope
             }
             else
             {
+                // Output images rotate without regard to the host, which can
+                // keep scanning one out until its next flip. Don't draw into
+                // it before then.
+                if ( gamescope::Rc<CVulkanTexture> pNextImage = vulkan_get_next_output_image( false ) )
+                {
+                    CWaylandFb *pNextFb = static_cast<CWaylandFb *>( pNextImage->GetBackendFb() );
+                    if ( pNextFb && !m_pBackend->WaitForHostRelease( pNextFb ) )
+                        return -EAGAIN;
+                }
+
                 std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false );
 
                 if ( !oCompositeResult )
@@ -2204,6 +2220,56 @@ namespace gamescope
     void CWaylandBackend::DirtyState( bool bForce, bool bForceModeset )
     {
     }
+    bool CWaylandBackend::WaitForHostRelease( CWaylandFb *pFb )
+    {
+        static constexpr uint64_t k_ulTimeout = 100'000'000ul;
+
+        const uint64_t ulDeadline = get_time_in_nanos() + k_ulTimeout;
+        while ( pFb->IsCompositorAcquired() )
+        {
+            wl_display_flush( m_pDisplay );
+
+            if ( wl_display_prepare_read( m_pDisplay ) != 0 )
+            {
+                if ( wl_display_dispatch_pending( m_pDisplay ) < 0 )
+                    return false;
+                continue;
+            }
+
+            const uint64_t ulNow = get_time_in_nanos();
+            if ( ulNow >= ulDeadline )
+            {
+                wl_display_cancel_read( m_pDisplay );
+                xdg_log.debugf( "Host compositor still holds the next output image after %" PRIu64 "ms, skipping a frame", k_ulTimeout / 1'000'000ul );
+                return false;
+            }
+
+            pollfd pollfd =
+            {
+                .fd     = wl_display_get_fd( m_pDisplay ),
+                .events = POLLIN,
+            };
+
+            int nRet = poll( &pollfd, 1, int( ( ulDeadline - ulNow + 999'999ul ) / 1'000'000ul ) );
+            if ( nRet > 0 )
+            {
+                if ( wl_display_read_events( m_pDisplay ) < 0 )
+                    return false;
+            }
+            else
+            {
+                wl_display_cancel_read( m_pDisplay );
+                if ( nRet < 0 && errno != EINTR && errno != EAGAIN )
+                    return false;
+            }
+
+            if ( wl_display_dispatch_pending( m_pDisplay ) < 0 )
+                return false;
+        }
+
+        return true;
+    }
+
     bool CWaylandBackend::PollState()
     {
         wl_display_flush( m_pDisplay );

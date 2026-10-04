@@ -5005,6 +5005,17 @@ gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool d
 	return g_output.outputImages[ nOutImage ];
 }
 
+gamescope::Rc<CVulkanTexture> vulkan_get_next_output_image( bool partial )
+{
+	if ( g_output.outputImages.empty() )
+		return nullptr;
+
+	if ( partial )
+		return g_output.outputImagesPartialOverlay[ g_output.nOutImage ];
+
+	return g_output.outputImages[ g_output.nOutImage ];
+}
+
 bool vulkan_primary_dev_id(dev_t *id)
 {
 	*id = g_device.primaryDevId();
