@@ -133,6 +133,7 @@ namespace gamescope
     struct WaylandPlaneState
     {
         wl_buffer *pBuffer;
+        CWaylandFb *pFb;
         int32_t nDestX;
         int32_t nDestY;
         double flSrcX;
@@ -1608,6 +1609,10 @@ namespace gamescope
 
             m_bHasAttachedBuffer = true;
 
+            // Take the compositor hold where the buffer is actually attached,
+            // rather than at the call sites that build the plane state.
+            if ( oState->pFb )
+                oState->pFb->OnCompositorAcquire();
             wl_surface_attach( m_pSurface, oState->pBuffer, 0, 0 );
             wl_surface_damage( m_pSurface, 0, 0, INT32_MAX, INT32_MAX );
             wl_surface_set_opaque_region( m_pSurface, oState->bOpaque ? m_pBackend->GetFullRegion() : nullptr );
@@ -1662,12 +1667,11 @@ namespace gamescope
 
         if ( pBuffer )
         {
-            pWaylandFb->OnCompositorAcquire();
-
             Present(
                 ClipPlane( WaylandPlaneState
                 {
                     .pBuffer     = pBuffer,
+                    .pFb         = pWaylandFb,
                     .nDestX      = int32_t( -pLayer->offset.x ),
                     .nDestY      = int32_t( -pLayer->offset.y ),
                     .flSrcX      = 0.0,
